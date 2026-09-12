@@ -153,6 +153,59 @@ def 手机号登录(
     )
 
 
+def _旧版请求(session: requests.Session, 路径: str, 数据: dict[str, str], 超时: int) -> dict[str, Any]:
+    """兼容旧版客户端协议；该协议来自 pgsh.py 的登录请求。"""
+    请求头 = {
+        "Version": "1.59.3",
+        "channel": "android_app",
+        "phoneBrand": "Redmi",
+        "timestamp": str(int(time.time() * 1000)),
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "User-Agent": "okhttp/3.14.9",
+        "Accept-Encoding": "gzip",
+    }
+    response = session.post(f"{基础地址}{路径}", data=数据, headers=请求头, timeout=超时)
+    response.raise_for_status()
+    try:
+        内容 = response.json()
+    except ValueError as exc:
+        raise 登录协议错误(f"旧版接口 {路径} 返回的不是 JSON") from exc
+    if 内容.get("code") != 0:
+        raise 登录协议错误(
+            f"旧版接口 {路径} 失败：code={内容.get('code')}，msg={内容.get('msg', '未知错误')}"
+        )
+    return 内容
+
+
+def 旧版发送短信验证码(session: requests.Session, 手机号: str, 超时: int) -> None:
+    """使用旧版兼容协议发送短信验证码。"""
+    _旧版请求(session, "/common/sms/sendCode", {"phone": 手机号, "template": "reg"}, 超时)
+
+
+def 旧版手机号登录(
+    session: requests.Session,
+    手机号: str,
+    短信验证码: str,
+    超时: int,
+) -> 登录结果:
+    """使用旧版兼容协议提交手机号验证码。"""
+    内容 = _旧版请求(
+        session,
+        "/user/reg",
+        {"channel": "android_app", "phone": 手机号, "verify": 短信验证码},
+        超时,
+    )
+    数据 = 内容.get("data") or {}
+    令牌 = 数据.get("token")
+    if not isinstance(令牌, str) or not 令牌:
+        raise 登录协议错误("旧版登录响应中没有找到 token")
+    return 登录结果(
+        令牌=令牌,
+        新用户=bool(数据.get("newRegister")),
+        强制绑定=bool(数据.get("forcedBind")),
+    )
+
+
 def _脱敏令牌(令牌: str) -> str:
     """默认只显示首尾少量字符，避免令牌泄露到终端记录。"""
     if len(令牌) <= 8:
@@ -185,19 +238,33 @@ def 主程序() -> int:
     })
 
     try:
-        需要图形验证码 = 检查图形验证码(session, 手机号, 参数.超时, 设备号)
-        if 需要图形验证码:
+        旧版模式 = False
+        try:
+            需要图形验证码 = 检查图形验证码(session, 手机号, 参数.超时, 设备号)
+        except 登录协议错误 as exc:
+            if "HTTP 405" not in str(exc):
+                raise
+            旧版模式 = True
+            print("新版签名通道返回 405，切换到旧版兼容登录协议。")
+
+        if not 旧版模式 and 需要图形验证码:
             print("服务端要求图形验证码；当前脚本未实现图形验证码识别，请先完成验证后再继续。")
             return 3
 
-        发送短信验证码(session, 手机号, 参数.超时, 设备号)
+        if 旧版模式:
+            旧版发送短信验证码(session, 手机号, 参数.超时)
+        else:
+            发送短信验证码(session, 手机号, 参数.超时, 设备号)
         print("短信验证码已发送。")
         短信验证码 = getpass.getpass("短信验证码：").strip()
         if not 短信验证码:
             print("短信验证码不能为空。", file=sys.stderr)
             return 2
 
-        结果 = 手机号登录(session, 手机号, 短信验证码, 参数.超时, 设备号)
+        if 旧版模式:
+            结果 = 旧版手机号登录(session, 手机号, 短信验证码, 参数.超时)
+        else:
+            结果 = 手机号登录(session, 手机号, 短信验证码, 参数.超时, 设备号)
         输出令牌 = 结果.令牌 if 参数.显示令牌 else _脱敏令牌(结果.令牌)
         print(json.dumps({
             "登录成功": True,
