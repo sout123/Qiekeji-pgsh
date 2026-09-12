@@ -1,0 +1,8 @@
+# 本地登录态包含 Token、设备号和 Cookie，不应进入版本库。
+登录状态.json
+*.tmp
+__pycache__/
+*.py[cod]
+
+# HAR 可能包含手机号、Token、Cookie 和设备标识。
+*.har

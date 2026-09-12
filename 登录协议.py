@@ -19,6 +19,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -29,6 +30,7 @@ import requests
 默认设备号 = ""
 应用版本 = "1.139.0"
 应用密钥 = "nFU9pbG8YQoAe1kFh+E7eyrdlSLglwEJeA0wwHB1j5o="
+登录状态文件 = Path(__file__).with_name("登录状态.json")
 
 
 def build_signature(timestamp: str, token: str, path: str, version: str = 应用版本) -> str:
@@ -53,6 +55,54 @@ class 登录结果:
     令牌: str
     新用户: bool
     强制绑定: bool
+
+
+def 读取登录态(路径: Path = 登录状态文件) -> dict[str, Any] | None:
+    """读取本地登录态；文件不存在或内容损坏时返回空。"""
+    if not 路径.exists():
+        return None
+    try:
+        数据 = json.loads(路径.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(数据, dict) or not 数据.get("token") or not 数据.get("deviceId"):
+        return None
+    return 数据
+
+
+def 保存登录态(
+    令牌: str,
+    设备号: str,
+    手机号: str,
+    session: requests.Session,
+    路径: Path = 登录状态文件,
+) -> None:
+    """保存复用登录所需的 Token、设备号和会话 Cookie。"""
+    数据 = {
+        "token": 令牌,
+        "deviceId": 设备号,
+        "phone": 手机号,
+        "version": 应用版本,
+        "savedAt": int(time.time()),
+        "cookies": session.cookies.get_dict(),
+    }
+    路径.parent.mkdir(parents=True, exist_ok=True)
+    临时文件 = 路径.with_suffix(".tmp")
+    临时文件.write_text(json.dumps(数据, ensure_ascii=False, indent=2), encoding="utf-8")
+    临时文件.replace(路径)
+    try:
+        路径.chmod(0o600)
+    except OSError:
+        # Windows 下 ACL 可能不支持 POSIX 权限，文件仍会保存。
+        pass
+
+
+def 清除登录态(路径: Path = 登录状态文件) -> None:
+    """删除本地登录态文件。"""
+    try:
+        路径.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _请求(
@@ -199,16 +249,15 @@ def 主程序() -> int:
     解析器.add_argument("--超时", type=int, default=默认超时秒数, help="单次请求超时秒数")
     解析器.add_argument("--设备ID", default=默认设备号, help="客户端设备 ID；可从本人抓包中取得")
     解析器.add_argument("--显示令牌", action="store_true", help="显示完整登录 Token（谨慎使用）")
+    解析器.add_argument("--重新登录", action="store_true", help="忽略本地登录态，重新发送短信登录")
+    解析器.add_argument("--清除登录态", action="store_true", help="删除本地登录态后退出")
+    解析器.add_argument("--状态文件", type=Path, default=登录状态文件, help="本地登录态 JSON 文件路径")
     参数 = 解析器.parse_args()
 
-    手机号 = 参数.手机号 or input("手机号：").strip()
-    if not 手机号.isdigit() or len(手机号) < 6:
-        print("手机号格式不正确。", file=sys.stderr)
-        return 2
-    设备号 = 参数.设备ID or input("设备ID（可从本人抓包请求头取得）：").strip()
-    if not 设备号:
-        print("缺少设备ID；该接口会校验移动端设备请求头。", file=sys.stderr)
-        return 2
+    if 参数.清除登录态:
+        清除登录态(参数.状态文件)
+        print(f"已清除登录态：{参数.状态文件}")
+        return 0
 
     session = requests.Session()
     session.headers.update({
@@ -217,6 +266,24 @@ def 主程序() -> int:
     })
 
     try:
+        本地登录态 = None if 参数.重新登录 else 读取登录态(参数.状态文件)
+        if 本地登录态:
+            设备号 = 参数.设备ID or str(本地登录态["deviceId"])
+            session.cookies.update(本地登录态.get("cookies", {}))
+            print("已读取本地登录态，跳过短信登录。")
+            print("账户余额与积分：")
+            查询余额(session, str(本地登录态["token"]), 参数.超时, 设备号)
+            return 0
+
+        手机号 = 参数.手机号 or input("手机号：").strip()
+        if not 手机号.isdigit() or len(手机号) < 6:
+            print("手机号格式不正确。", file=sys.stderr)
+            return 2
+        设备号 = 参数.设备ID or input("设备ID（可从本人抓包请求头取得）：").strip()
+        if not 设备号:
+            print("缺少设备ID；该接口会校验移动端设备请求头。", file=sys.stderr)
+            return 2
+
         需要图形验证码 = 检查图形验证码(session, 手机号, 参数.超时, 设备号)
 
         if 需要图形验证码:
@@ -231,6 +298,8 @@ def 主程序() -> int:
             return 2
 
         结果 = 手机号登录(session, 手机号, 短信验证码, 参数.超时, 设备号)
+        保存登录态(结果.令牌, 设备号, 手机号, session, 参数.状态文件)
+        print(f"登录态已保存：{参数.状态文件}")
         输出令牌 = 结果.令牌 if 参数.显示令牌 else _脱敏令牌(结果.令牌)
         print(json.dumps({
             "登录成功": True,
