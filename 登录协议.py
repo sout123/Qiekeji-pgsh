@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -41,6 +42,31 @@ def build_signature(timestamp: str, token: str, path: str, version: str = 应用
         f"&timestamp={timestamp}"
         f"&token={token}"
         f"&version={version}"
+        f"&{path}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_order_risk_signature(
+    category_code: str,
+    imei: str,
+    latitude: str,
+    longitude: str,
+    timestamp: str,
+    token: str,
+    path: str,
+) -> str:
+    """生成解锁接口使用的定位风控签名。"""
+    raw = (
+        f"appSecret={应用密钥}"
+        f"&categoryCode={category_code}"
+        f"&channel=android_app"
+        f"&imei={imei}"
+        f"&lat={latitude}"
+        f"&lng={longitude}"
+        f"&timestamp={timestamp}"
+        f"&token={token}"
+        f"&version={应用版本}"
         f"&{path}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -111,10 +137,11 @@ def _请求(
     数据: dict[str, str],
     超时: int,
     设备号: str,
+    额外请求头: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """发送表单请求并统一检查 HTTP 与业务层状态。"""
     # 登录接口会检查移动端公共请求头；HAR 中的 timestamp 每次请求都会变化。
-    timestamp = str(int(time.time() * 1000))
+    timestamp = (额外请求头 or {}).get("timestamp", str(int(time.time() * 1000)))
     token = str(数据.get("token", ""))
     sign = build_signature(timestamp, token, 路径)
     请求头 = {
@@ -132,6 +159,8 @@ def _请求(
         "Connection": "Keep-Alive",
         "Accept-Encoding": "gzip",
     }
+    if 额外请求头:
+        请求头.update(额外请求头)
     response = session.post(
         f"{基础地址}{路径}",
         data=数据,
@@ -236,6 +265,261 @@ def 查询余额(
     return 结果
 
 
+def parse_scan_url(scan_url: str) -> str:
+    """从扫码结果 URL 中提取 SN 参数。"""
+    parsed = urlparse(scan_url.strip())
+    sn = parse_qs(parsed.query).get("SN", [""])[0].strip()
+    if not sn:
+        raise 登录协议错误("扫码链接中没有找到 SN 参数")
+    return sn
+
+
+def scan_goods(session: requests.Session, token: str, device_id: str, timeout: int, scan_url: str) -> dict[str, Any]:
+    """通过二维码 SN 获取商品基本信息。"""
+    sn = parse_scan_url(scan_url)
+    content = _请求(session, "/goods/scan/v2", {"SN": sn, "token": token}, timeout, device_id)
+    data = content.get("data") or {}
+    goods_id = data.get("id")
+    if not goods_id:
+        raise 登录协议错误("扫码接口没有返回 goodsId")
+    data["goodsId"] = str(goods_id)
+    print(json.dumps({"扫码SN": sn, "商品信息": data}, ensure_ascii=False, indent=2))
+    return data
+
+
+def get_goods_details(session: requests.Session, token: str, device_id: str, timeout: int, goods_id: str) -> dict[str, Any]:
+    """获取饮水机详情，包括 orgId、IMEI、shopId 等解锁参数。"""
+    content = _请求(session, "/goods/normal/details", {"goodsId": goods_id, "token": token}, timeout, device_id)
+    data = content.get("data") or {}
+    required = ("goodsId", "categoryCode", "orgId", "imei", "shopId")
+    missing = [name for name in required if data.get(name) in (None, "")]
+    if missing:
+        raise 登录协议错误(f"商品详情缺少解锁字段：{', '.join(missing)}")
+    print(json.dumps({
+        "商品ID": data.get("goodsId"),
+        "名称": data.get("name"),
+        "分类": data.get("categoryCode"),
+        "机构ID": data.get("orgId"),
+        "设备IMEI": data.get("imei"),
+        "店铺ID": data.get("shopId"),
+        "机器ID": data.get("machineId"),
+        "支付模式": data.get("payment"),
+    }, ensure_ascii=False, indent=2))
+    return data
+
+
+def get_goods_skus(session: requests.Session, token: str, device_id: str, timeout: int, goods_id: str) -> list[dict[str, Any]]:
+    """获取商品 SKU 列表，解锁使用 skuId 而不是 goodsId。"""
+    content = _请求(session, "/goods/normal/skus", {"goodsId": goods_id, "token": token}, timeout, device_id)
+    skus = content.get("data") or []
+    if not isinstance(skus, list) or not skus:
+        raise 登录协议错误("商品没有可用 SKU")
+    return skus
+
+
+def build_promotions(use_integral: bool) -> str:
+    """构造积分抵扣开关；8 启用，-8 不启用。"""
+    promotions = [
+        {"assetId": "0", "oldPromotionId": "", "orgId": "0", "promotionId": "0", "promotionType": "-6"},
+        {"assetId": "0", "oldPromotionId": "", "orgId": "0", "promotionId": "0", "promotionType": "-7"},
+        {"assetId": "0", "oldPromotionId": "0", "orgId": "0", "promotionId": "0", "promotionType": "8" if use_integral else "-8"},
+    ]
+    return json.dumps(promotions, ensure_ascii=False, separators=(",", ":"))
+
+
+def check_integral_available(session: requests.Session, token: str, device_id: str, timeout: int) -> None:
+    """读取积分使用规则，并在服务端风控拒绝时停止流程。"""
+    rule_content = _请求(session, "/userIntegral/limitRule", {"token": token}, timeout, device_id)
+    rule = rule_content.get("data") or {}
+    print(json.dumps({"积分规则": rule}, ensure_ascii=False, indent=2))
+    risk_content = _请求(session, "/userIntegral/checkUserIsRisk", {"token": token}, timeout, device_id)
+    if risk_content.get("data") is True:
+        raise 登录协议错误("服务端判定当前账号不能使用积分抵扣")
+
+
+def prepare_unlock(session: requests.Session, token: str, device_id: str, timeout: int, details: dict[str, Any]) -> None:
+    """执行解锁前的支付渠道和位置风控检查。"""
+    _请求(session, "/payChannelRoute/addUserAfterPayChannel", {"method": "15", "token": token}, timeout, device_id)
+    _请求(
+        session,
+        "/orderRisk/isCheckLocation",
+        {
+            "categoryCode": str(details.get("categoryCode", "")),
+            "imei": str(details.get("imei", "")),
+            "orgId": str(details.get("orgId", "")),
+            "token": token,
+        },
+        timeout,
+        device_id,
+    )
+
+
+def unlock_water(
+    session: requests.Session,
+    token: str,
+    device_id: str,
+    timeout: int,
+    sku_id: str,
+    details: dict[str, Any],
+    use_integral: bool,
+    latitude: str,
+    longitude: str,
+) -> dict[str, Any]:
+    """提交饮水机解锁请求；该操作会产生真实设备和订单状态变化。"""
+    category_code = str(details.get("categoryCode", ""))
+    imei = str(details.get("imei", ""))
+    timestamp = str(int(time.time() * 1000))
+    extra_headers = {
+        "imei": imei,
+        "categoryCode": category_code,
+        "timestamp": timestamp,
+    }
+    if latitude and longitude:
+        extra_headers["lat"] = latitude
+        extra_headers["lng"] = longitude
+        extra_headers["orderRiskSign"] = build_order_risk_signature(
+            category_code, imei, latitude, longitude, timestamp, token, "/goods/water/unlock"
+        )
+        extra_headers["orderRiskTimestamp"] = timestamp
+
+    # _请求会重新生成普通 sign；这里让两种时间戳一致，避免风控签名失配。
+    content = _请求(
+        session,
+        "/goods/water/unlock",
+        {"skuId": sku_id, "promotions": build_promotions(use_integral), "token": token},
+        timeout,
+        device_id,
+        extra_headers,
+    )
+    data = content.get("data") or {}
+    if not data.get("orderNo"):
+        raise 登录协议错误("解锁响应没有返回 orderNo")
+    return data
+
+
+def poll_water_status(
+    session: requests.Session,
+    token: str,
+    device_id: str,
+    timeout: int,
+    sku_id: str,
+    max_attempts: int = 60,
+) -> dict[str, Any]:
+    """轮询设备状态，区分工作中、未使用和已使用。"""
+    last_data: dict[str, Any] = {}
+    for attempt in range(max_attempts):
+        content = _请求(session, "/goods/water/sync", {"skuId": sku_id, "token": token}, timeout, device_id)
+        data = content.get("data") or {}
+        last_data = data
+        work_status = data.get("workStatus")
+        amount = data.get("amount")
+        if work_status != 2 and amount is not None:
+            if isinstance(amount, (int, float)) and amount > 0:
+                print(f"设备状态：已使用，设备使用量={amount}")
+            else:
+                print("设备状态：已解锁，但未产生使用量。")
+            return data
+        print(f"设备状态：工作中（第 {attempt + 1} 次轮询）")
+        time.sleep(1.5)
+    raise 登录协议错误(f"设备状态轮询超时，最后结果：{last_data}")
+
+
+def get_order_detail(
+    session: requests.Session,
+    token: str,
+    device_id: str,
+    timeout: int,
+    order_id: str,
+) -> dict[str, Any]:
+    """查询最终订单详情并输出金额、抵扣和使用值。"""
+    content = _请求(session, "/order/detail", {"orderId": order_id, "token": token}, timeout, device_id)
+    data = content.get("data") or {}
+    trade_items = data.get("tradeOrderItem") or []
+    item = trade_items[0] if trade_items else {}
+    sku_info = item.get("skuInfo") or {}
+    result = {
+        "订单号": data.get("orderNo"),
+        "订单状态": data.get("orderStatus"),
+        "机器名称": data.get("machineName"),
+        "功能": data.get("machineFunctionName"),
+        "标价": data.get("markPrice"),
+        "实付": data.get("payPrice"),
+        "余额抵扣": data.get("tokenCoinDiscount"),
+        "订单使用值": sku_info.get("waterUseValue"),
+        "优惠记录": data.get("promotionList"),
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return data
+
+
+def create_and_query_order(
+    session: requests.Session,
+    token: str,
+    device_id: str,
+    timeout: int,
+    order_no: str,
+) -> dict[str, Any]:
+    """实际使用后创建并同步订单，再读取账单。"""
+    _请求(session, "/order/afterPay/creating", {"orderNo": order_no, "token": token}, timeout, device_id)
+    for _ in range(10):
+        content = _请求(
+            session,
+            "/order/sync",
+            {"orderNo": order_no, "payType": "0", "token": token},
+            timeout,
+            device_id,
+        )
+        data = content.get("data") or {}
+        if data.get("code") == 0:
+            return get_order_detail(session, token, device_id, timeout, order_no)
+        time.sleep(1)
+    print("订单仍在同步，暂未读取到最终账单。")
+    return {}
+
+
+def run_scan_flow(
+    session: requests.Session,
+    token: str,
+    device_id: str,
+    timeout: int,
+    scan_url: str,
+    use_integral: bool,
+    latitude: str,
+    longitude: str,
+) -> None:
+    """执行扫码识别、选择抵扣、解锁、状态判断和订单查询。"""
+    scan_data = scan_goods(session, token, device_id, timeout, scan_url)
+    goods_id = str(scan_data["goodsId"])
+    details = get_goods_details(session, token, device_id, timeout, goods_id)
+    skus = get_goods_skus(session, token, device_id, timeout, goods_id)
+    print("可用商品 SKU：")
+    for index, sku in enumerate(skus):
+        print(f"[{index}] skuId={sku.get('skuId')} 名称={sku.get('name')} 价格={sku.get('price')}")
+    choice = input("请选择 SKU 编号（默认 0）：").strip() or "0"
+    try:
+        sku = skus[int(choice)]
+    except (ValueError, IndexError):
+        raise 登录协议错误("SKU 编号无效")
+    sku_id = str(sku.get("skuId"))
+    print(f"积分抵扣：{'启用' if use_integral else '不启用'}（promotionType={'8' if use_integral else '-8'}）")
+    if use_integral:
+        check_integral_available(session, token, device_id, timeout)
+    if input("确认执行真实解锁？请输入 YES：").strip() != "YES":
+        print("已取消解锁。")
+        return
+    prepare_unlock(session, token, device_id, timeout, details)
+    unlock_data = unlock_water(
+        session, token, device_id, timeout, sku_id, details, use_integral, latitude, longitude
+    )
+    order_no = str(unlock_data["orderNo"])
+    print(f"解锁成功：msgId={unlock_data.get('msgId')} orderNo={order_no}")
+    status = poll_water_status(session, token, device_id, timeout, sku_id)
+    amount = status.get("amount")
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        print("本次结果：已解锁但未使用，不创建消费订单。"); return
+    create_and_query_order(session, token, device_id, timeout, order_no)
+
+
 def _脱敏令牌(令牌: str) -> str:
     """默认只显示首尾少量字符，避免令牌泄露到终端记录。"""
     if len(令牌) <= 8:
@@ -252,6 +536,12 @@ def 主程序() -> int:
     解析器.add_argument("--重新登录", action="store_true", help="忽略本地登录态，重新发送短信登录")
     解析器.add_argument("--清除登录态", action="store_true", help="删除本地登录态后退出")
     解析器.add_argument("--状态文件", type=Path, default=登录状态文件, help="本地登录态 JSON 文件路径")
+    解析器.add_argument("--扫描链接", help="二维码识别结果，例如 https://h5.qiekj.com/skip?SN=...")
+    抵扣组 = 解析器.add_mutually_exclusive_group()
+    抵扣组.add_argument("--使用积分", action="store_true", help="解锁时使用积分抵扣")
+    抵扣组.add_argument("--不使用积分", action="store_true", help="解锁时不使用积分抵扣")
+    解析器.add_argument("--纬度", default="", help="解锁风控纬度，可选")
+    解析器.add_argument("--经度", default="", help="解锁风控经度，可选")
     参数 = 解析器.parse_args()
 
     if 参数.清除登录态:
@@ -273,6 +563,22 @@ def 主程序() -> int:
             print("已读取本地登录态，跳过短信登录。")
             print("账户余额与积分：")
             查询余额(session, str(本地登录态["token"]), 参数.超时, 设备号)
+            扫描链接 = 参数.扫描链接 or input("扫码结果URL（回车仅查看余额）：").strip()
+            if 扫描链接:
+                if not 参数.使用积分 and not 参数.不使用积分:
+                    使用积分 = input("本次使用积分抵扣？请输入 Y/N：").strip().upper() == "Y"
+                else:
+                    使用积分 = 参数.使用积分
+                run_scan_flow(
+                    session,
+                    str(本地登录态["token"]),
+                    设备号,
+                    参数.超时,
+                    扫描链接,
+                    使用积分,
+                    参数.纬度,
+                    参数.经度,
+                )
             return 0
 
         手机号 = 参数.手机号 or input("手机号：").strip()
@@ -309,6 +615,22 @@ def 主程序() -> int:
         }, ensure_ascii=False, indent=2))
         print("账户余额与积分：")
         查询余额(session, 结果.令牌, 参数.超时, 设备号)
+        扫描链接 = 参数.扫描链接 or input("扫码结果URL（回车仅查看余额）：").strip()
+        if 扫描链接:
+            if not 参数.使用积分 and not 参数.不使用积分:
+                使用积分 = input("本次使用积分抵扣？请输入 Y/N：").strip().upper() == "Y"
+            else:
+                使用积分 = 参数.使用积分
+            run_scan_flow(
+                session,
+                结果.令牌,
+                设备号,
+                参数.超时,
+                扫描链接,
+                使用积分,
+                参数.纬度,
+                参数.经度,
+            )
         return 0
     except requests.RequestException as exc:
         print(f"网络请求失败：{exc}", file=sys.stderr)
