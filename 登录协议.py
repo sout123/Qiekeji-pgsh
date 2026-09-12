@@ -77,6 +77,10 @@ def _请求(
         "sign": sign,
         "User-Agent": "QEUser/1.139.0 (com.qiekj.user; build:234; Android 16; userChannel:android_app; version:1.139.0) OkHttp/4.12.0",
         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        # 以下三个头与 HAR 中的 OkHttp 请求保持一致，避免被网关按请求形态拦截。
+        "Host": "userapi.qiekj.com",
+        "Connection": "Keep-Alive",
+        "Accept-Encoding": "gzip",
     }
     response = session.post(
         f"{基础地址}{路径}",
