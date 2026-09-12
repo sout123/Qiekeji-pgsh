@@ -157,6 +157,35 @@ def 手机号登录(
     )
 
 
+def 查询余额(
+    session: requests.Session,
+    令牌: str,
+    超时: int,
+    设备号: str,
+) -> dict[str, Any]:
+    """查询账户余额、积分和积分可抵扣金额。"""
+    内容 = _请求(session, "/user/balance", {"token": 令牌}, 超时, 设备号)
+    数据 = 内容.get("data") or {}
+    token_coin = 数据.get("tokenCoin")
+    integral = 数据.get("integral")
+    integral_amount = 数据.get("integralAmount")
+    if not isinstance(token_coin, (int, float)):
+        raise 登录协议错误("余额响应中缺少有效的 tokenCoin")
+    if not isinstance(integral, (int, float)):
+        raise 登录协议错误("余额响应中缺少有效的 integral")
+    if integral_amount is None:
+        raise 登录协议错误("余额响应中缺少 integralAmount")
+
+    结果 = {
+        "tokenCoin": token_coin,
+        "余额": token_coin / 100,
+        "integral": integral,
+        "integralAmount": str(integral_amount),
+    }
+    print(json.dumps(结果, ensure_ascii=False, indent=2))
+    return 结果
+
+
 def _脱敏令牌(令牌: str) -> str:
     """默认只显示首尾少量字符，避免令牌泄露到终端记录。"""
     if len(令牌) <= 8:
@@ -185,7 +214,6 @@ def 主程序() -> int:
     session.headers.update({
         # HTTP 请求头不能直接使用中文，使用 ASCII 兼容的 Android UA。
         "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 16; Android SDK built for x86_64)",
-        "Accept": "application/json",
     })
 
     try:
@@ -210,6 +238,8 @@ def 主程序() -> int:
             "newRegister": 结果.新用户,
             "forcedBind": 结果.强制绑定,
         }, ensure_ascii=False, indent=2))
+        print("账户余额与积分：")
+        查询余额(session, 结果.令牌, 参数.超时, 设备号)
         return 0
     except requests.RequestException as exc:
         print(f"网络请求失败：{exc}", file=sys.stderr)
